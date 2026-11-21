@@ -23,3 +23,7 @@ efioex6/censored_review/
 /efioex6/__pycache__
 efioex6/timestamps.json
 /efioex6/models
+/efioex7/__pycache__
+/efioex7/frames
+*.onnx
+/efioex7/models/SmilingWolf__wd-v1-4-moat-tagger-v2
