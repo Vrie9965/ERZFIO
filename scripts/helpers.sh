@@ -33,6 +33,8 @@ check_dependencies() {
 }
 
 # Verify Facebook Page Access Token
+VALIDATED_PAGE_NAME=""
+
 check_token() {
     if [ -z "${FB_PAGE_TOKEN:-}" ]; then
         log_error "FB_PAGE_TOKEN secret is not set! Please add it in your repository secrets."
@@ -66,12 +68,7 @@ check_token() {
     fi
 
     log_info "Connected to Facebook Page: $current_page_name (ID: $current_page_id)"
-
-    # Optional verification against expected page name
-    if [ -n "${page_name:-}" ] && [ "$page_name" != "$current_page_name" ]; then
-        log_error "Page name mismatch: Config expects '$page_name', but token is for '$current_page_name'"
-        return 1
-    fi
+    VALIDATED_PAGE_NAME="$current_page_name"
 
     return 0
 }

@@ -115,12 +115,6 @@ else
     record_check "mins" "FAIL" "Must be a non-negative integer."
 fi
 
-if [ -n "${page_name:-}" ]; then
-    record_check "page_name" "PASS" "Optional page name is configured."
-else
-    record_check "page_name" "PASS" "Optional page name is not configured."
-fi
-
 if [ -z "${album_id:-}" ]; then
     record_check "album_id" "PASS" "No album configured; album copy is disabled."
 elif is_positive_integer "$album_id"; then
@@ -209,11 +203,20 @@ if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 &&
     declare -F check_token >/dev/null; then
     if check_token; then
         record_check "FB_PAGE_TOKEN" "PASS" "Token was validated."
+        if [ -z "${page_name:-}" ]; then
+            record_check "page_name" "PASS" "Optional Page name check is disabled."
+        elif [ "$page_name" = "$VALIDATED_PAGE_NAME" ]; then
+            record_check "page_name" "PASS" "Matches the Facebook Page name exactly."
+        else
+            record_check "page_name" "FAIL" "Configured '$page_name', but Facebook returned '$VALIDATED_PAGE_NAME'."
+        fi
     else
         record_check "FB_PAGE_TOKEN" "FAIL" "Token validation failed."
+        record_check "page_name" "FAIL" "Could not verify the Page name because token validation failed."
     fi
 else
     record_check "FB_PAGE_TOKEN" "FAIL" "Cannot validate token because curl, jq, or the token checker is unavailable."
+    record_check "page_name" "FAIL" "Could not verify the Page name because validation tools or the token checker are unavailable."
 fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

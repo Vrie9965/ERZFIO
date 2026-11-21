@@ -24,7 +24,7 @@ mins=2
 
 # --- Page Verification ---
 # Optional: Set your page name to verify token matches during check
-page_name="Every Re:Zero Frame In Order"
+page_name="Every ReZero Frame in Order"
 
 # Optional: Facebook Page album ID. Leave blank to post only to the Page.
 # Example only (do not use this sample ID):
