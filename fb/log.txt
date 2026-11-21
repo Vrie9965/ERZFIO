@@ -1,0 +1,5 @@
+# Post Log
+# [√] Successful post
+# [~] Partial post (photo posted, optional addon failed)
+# [!] Post failed
+# -------------------------------------------------------------

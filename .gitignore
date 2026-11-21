@@ -1,0 +1,17 @@
+# Video files and raw cuts
+*.mp4
+*.mkv
+*.webm
+
+# Accidental secret tokens (DO NOT commit tokens!)
+secret.sh
+.env
+*.token
+
+# System / OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.tmp
+*.bak

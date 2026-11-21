@@ -1,0 +1,27 @@
+name: Check Repository Health
+
+on:
+  workflow_dispatch: # Can be triggered manually anytime with one click
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq bc curl
+
+      - name: Set script execution permissions
+        run: |
+          chmod +x *.sh scripts/*.sh
+
+      - name: Run Repository Pre-Flight Check
+        env:
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          DRY_RUN: "1"
+        run: |
+          bash checkermain.sh

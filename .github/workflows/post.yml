@@ -1,0 +1,67 @@
+name: Post Frames to Facebook
+
+on:
+  schedule:
+    # Runs every 2 hours
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Posting mode'
+        required: true
+        default: 'live'
+        type: choice
+        options:
+          - live
+          - dry_run
+      fph_override:
+        description: 'Override number of frames to post (leave blank for config default)'
+        required: false
+        default: ''
+
+# Prevent overlapping runs from modifying git state at the same time
+concurrency:
+  group: fb-post-engine
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq bc curl
+
+      - name: Set script execution permissions
+        run: |
+          chmod +x *.sh scripts/*.sh
+
+      - name: Run Frame Poster Batch
+        env:
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') && '1' || '0' }}
+          FPH_OVERRIDE: ${{ github.event.inputs.fph_override }}
+        run: |
+          ./frame_main.sh
+
+      - name: Commit and push updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fb/state.json fb/log.txt
+
+          if git diff --staged --quiet; then
+            echo "No state changes to commit."
+          else
+            CURRENT=$(jq -r '.current_frame' fb/state.json 2>/dev/null || echo "updated")
+            git commit -m "[skip ci] Update state: Frame #$CURRENT"
+            git pull --rebase
+            git push
+          fi

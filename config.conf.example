@@ -1,0 +1,44 @@
+# =============================================================
+# ERZFIO Configuration File
+# Every Re:Zero Frame in Order
+# =============================================================
+
+# --- Anime Information ---
+anime_name="Re:Zero - Starting Life in Another World"
+season="1"
+episode="1"
+
+# --- Frame Settings ---
+# Total frames in this episode (update this after cutting frames)
+total_frame=1000
+
+# Framerate used when cutting (used to calculate timestamp in caption)
+img_fps=8
+
+# --- Posting Schedule Settings ---
+# Number of frames to post per scheduled run (fph)
+fph=10
+
+# Sleep time in minutes between posting each frame (mins)
+mins=2
+
+# --- Page Verification ---
+# Optional: Set your page name to verify token matches during check
+page_name="Every Re:Zero Frame In Order"
+
+# --- Caption Template ---
+# Available variables:
+# {anime_name}, {season}, {episode}, {current_frame}, {total_frame}, {timestamp}
+caption_template="{anime_name} - S{season}E{episode} - Frame {current_frame} of {total_frame} ({timestamp})"
+
+# --- Directory Settings ---
+frames_dir="frames"
+commentsubs_dir="commentsubs"
+
+# --- Addons ---
+# Set to true if you want to post subtitle screenshots as comments under the frame
+enable_commentsubs=false
+
+# --- Dry Run Mode ---
+# 0 = live posting, 1 = test run (validates everything without posting)
+DRY_RUN="${DRY_RUN:-0}"
