@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
-r"""
-efioex6.py — Every Frame In Order Extractor (Version 6)
-Streaming extraction with smart motion detection, pan thinning, Facebook safety,
-cyclical talking/idle loop thinning, strict fade throttling, and High-Speed 1024 MB Async RAM Buffering.
-
-Staged Pipeline:
-  Stage 1: Streaming Chopping & Deduplication
-           • Drops pitch-black frames.
-           • Drops frozen stills (protects blinks & mouth flaps).
-           • Thins long camera pans (keeps Start 0%, Mid 50%, End 100%).
-           • Throttles fading transitions & text fades (caps at 5 frames max).
-           • Asynchronous background disk writer buffered up to 1024 MB for maximum FPS.
-  Stage 2: Cyclical & Talking Loop Filter (thins repeated mouth-flaps/idle loops across speech timeline).
-  Stage 3: Safety & Censorship (runs ONLY on surviving frames: accurate blood & lewd checks).
-  Stage 4: Subtitle Burning (burns subtitles into commentsubs/ matching survivors 1-to-1).
-"""
+"""Extracts anime frames through motion-aware filtering and staged processing.
+Applies censorship checks, timestamp tracking, and optional subtitle burning."""
 
 import os
+import csv
+import re
+import tempfile
 import sys
 import gc
 import json
@@ -26,9 +15,12 @@ import shutil
 import platform
 import threading
 import subprocess
+import urllib.request
 from collections import deque
+from fractions import Fraction
 
-# --- Dependency Check and Auto-Install ---
+# Dependency setup checks required modules and installs missing packages.
+# Imports that depend on those packages are loaded after this check.
 REQUIRED_PACKAGES = {
     "PIL": "Pillow",
     "imagehash": "imagehash",
@@ -38,6 +30,8 @@ REQUIRED_PACKAGES = {
 }
 
 def ensure_packages() -> None:
+    """Checks required imports and installs any missing packages.
+    Stops startup when a required dependency cannot be installed."""
     import importlib
     missing = []
     for module_name, pip_name in REQUIRED_PACKAGES.items():
@@ -66,45 +60,46 @@ import numpy as np
 from PIL import Image
 import imagehash
 
-
-# =============================================================
-# Configuration Defaults
-# =============================================================
-
+# Configuration defaults define the extractor settings.
+# CONFIG holds the active values loaded from the settings file.
 CONFIG_FILE = "config.txt"
 
 CONFIG_DEFAULTS = {
-    "ACCELERATION": "auto",           # auto = use GPU when available, cpu = force CPU
-    "MAX_RAM_BUFFER_MB": 1024,        # Maximum RAM buffer in MB for async disk writing
+    "ACCELERATION": "auto",
+    "MAX_RAM_BUFFER_MB": 1024,
     "VIDEO_FILE": "video.mkv",
     "OUTPUT_WIDTH": 1280,
     "QUALITY_CLEAN": 15,
     "QUALITY_SUBS": 30,
-    "SUBTITLE_STREAM": -1,            # -1 = auto-detect English track
-    "STILL_DIFF_THRESHOLD": 3.0,       # Maximum cell difference for true stills
-    "PAN_MIN_SECONDS": 2.0,            # Minimum duration for 3-point pan thinning
-    "BLACK_PIXEL_PERCENT": 98.0,       # % of near-black pixels to qualify as black frame
-    "BLACK_PIXEL_MAX_LUMA": 8,         # Max luma value for black pixels
-    "FADE_MAX_FRAMES": 5,              # Maximum frames to keep during any fading transition (black/text)
-    "ENABLE_LOOP_FILTER": True,        # Detect & thin repeating mouth flaps / idle loops
-    "LOOP_WINDOW_SIZE": 60,            # Rolling window to detect loops
-    "ENABLE_BLOOD_CENSOR": True,       # Grayscale blood & gore frames
-    "BLOOD_THRESHOLD_PERCENT": 5.0,    # % of deep crimson blood pixels needed to trigger
-    "ENABLE_LEWD_CENSOR": True,        # Gaussian blur sensitive areas
-    "LEWD_THRESHOLD_PERCENT": 25.0,    # % of exposed body skin area needed to trigger
-    "SAVE_CENSORED_REVIEW": True,      # Keep originals in censored_review/
+    "SUBTITLE_STREAM": -1,
+    "STILL_DIFF_THRESHOLD": 3.0,
+    "PAN_MIN_SECONDS": 2.0,
+    "BLACK_PIXEL_PERCENT": 98.0,
+    "BLACK_PIXEL_MAX_LUMA": 8,
+    "FADE_MAX_FRAMES": 5,
+    "ENABLE_LOOP_FILTER": True,
+    "LOOP_WINDOW_SIZE": 60,
+    "ENABLE_BLOOD_CENSOR": True,
+    "BLOOD_THRESHOLD_PERCENT": 0.4,
+    "BLOOD_CONTINUITY": True,
+
+    "BLOOD_HIGH_PERCENT": 40.0,
+    "BLOOD_BLOB_MIN_PERCENT": 0.02,
+    "BLOOD_TAGGER_VARIANTS": False,
+
+    "BLOOD_WD_TAGGER": True,
+    "BLOOD_TAG_CONFIDENCE": 0.35,
+    "BLOOD_TAGGER_MODEL": "SmilingWolf/wd-v1-4-moat-tagger-v2",
+    "ENABLE_LEWD_CENSOR": True,
+    "LEWD_THRESHOLD_PERCENT": 25.0,
+    "SAVE_CENSORED_REVIEW": True,
 }
 
-# Active runtime configuration
 CONFIG = dict(CONFIG_DEFAULTS)
 
-
-# =============================================================
-# Hardware & GPU Detection
-# =============================================================
-
 def detect_gpu_capabilities() -> dict:
-    """Detects GPU and hardware acceleration support (NVIDIA CUDA, NVDEC, OpenCL)."""
+    """Detects available NVIDIA hardware and OpenCL support.
+    Returns the acceleration details used to configure extraction."""
     info = {
         "has_nvidia": False,
         "gpu_name": "",
@@ -130,18 +125,12 @@ def detect_gpu_capabilities() -> dict:
 
     return info
 
-
-# =============================================================
-# Asynchronous Background Disk Writer (Buffered up to 1024 MB)
-# =============================================================
-
 class AsyncFrameWriter:
-    """
-    Decoupled background worker that saves survivor JPEGs to disk in parallel.
-    Buffers up to MAX_RAM_BUFFER_MB (default 1024 MB) in RAM so video decoding
-    never waits for disk I/O, maximizing decoding FPS while strictly preventing OOM.
-    """
+    """Writes selected frames to JPEG files on a background thread.
+    A bounded queue separates frame processing from disk I/O."""
     def __init__(self, max_buffer_frames: int = 250, quality: int = 15):
+        """Creates the bounded frame queue and starts its writer thread.
+        Stores the JPEG quality used for saved frames."""
         self.queue = queue.Queue(maxsize=max(20, max_buffer_frames))
         self.quality = quality
         self.stop_signal = object()
@@ -149,10 +138,13 @@ class AsyncFrameWriter:
         self.worker.start()
 
     def submit(self, path: str, bgr: np.ndarray) -> None:
-        """Adds a frame to the async queue. Blocks only if 1024 MB buffer is completely full."""
+        """Adds a frame to the bounded output queue.
+        Waits when the queue reaches its configured capacity."""
         self.queue.put((path, bgr), block=True)
 
     def _writer_loop(self) -> None:
+        """Consumes queued frames and writes them as JPEG files.
+        Marks each queue item complete after its write attempt."""
         while True:
             item = self.queue.get()
             if item is self.stop_signal:
@@ -170,24 +162,22 @@ class AsyncFrameWriter:
                 self.queue.task_done()
 
     def wait_completion(self) -> None:
-        """Flushes all queued frames to disk before proceeding to next stage."""
+        """Waits until all queued frames have finished saving.
+        Then signals the writer thread to stop and joins it."""
         self.queue.join()
         self.queue.put(self.stop_signal)
         self.worker.join()
 
-
-# =============================================================
-# Helper Utilities
-# =============================================================
-
 def get_script_dir() -> str:
-    """Returns the directory where this script lives."""
+    """Returns the folder containing the script or executable.
+    This folder is used as the base path for inputs and outputs."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 def sanitize_path(text: str) -> str:
-    """Removes personal username from paths for clean logging."""
+    """Masks the current user folder in displayed file paths.
+    Actual filesystem paths remain unchanged."""
     username = os.environ.get("USER", os.environ.get("USERNAME", ""))
     if username:
         text = text.replace(f"\\Users\\{username}", "\\Users\\User")
@@ -196,27 +186,25 @@ def sanitize_path(text: str) -> str:
     return text
 
 def write_jpeg(path: str, bgr: np.ndarray, quality: int) -> bool:
-    """Unicode-safe JPEG saving using cv2.imencode."""
+    """Encodes a frame and writes it as a JPEG file.
+    Uses OpenCV buffer output to support Unicode paths."""
     ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if ok:
         buf.tofile(path)
     return bool(ok)
 
 def format_timestamp(seconds: float) -> str:
-    """Converts seconds into HH:MM:SS string."""
+    """Converts a time value into HH:MM:SS format.
+    Used when creating the frame timestamp map."""
     s = max(0.0, float(seconds))
     hrs = int(s // 3600)
     mins = int((s % 3600) // 60)
     secs = int(s % 60)
     return f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
-
-# =============================================================
-# Configuration File Management
-# =============================================================
-
 def load_config(base_dir: str) -> dict:
-    """Loads configuration from config.txt."""
+    """Loads recognized settings from config.txt.
+    Invalid values leave their corresponding defaults unchanged."""
     cfg = dict(CONFIG_DEFAULTS)
     path = os.path.join(base_dir, CONFIG_FILE)
     if not os.path.exists(path):
@@ -249,7 +237,8 @@ def load_config(base_dir: str) -> dict:
     return cfg
 
 def save_config(base_dir: str, cfg: dict) -> None:
-    """Saves configuration back to config.txt."""
+    """Writes the active settings to config.txt.
+    Supported options are saved in a consistent order."""
     path = os.path.join(base_dir, CONFIG_FILE)
     lines = [
         "# efioex6 configuration file",
@@ -269,6 +258,13 @@ def save_config(base_dir: str, cfg: dict) -> None:
         f"LOOP_WINDOW_SIZE = {cfg['LOOP_WINDOW_SIZE']}",
         f"ENABLE_BLOOD_CENSOR = {'true' if cfg['ENABLE_BLOOD_CENSOR'] else 'false'}",
         f"BLOOD_THRESHOLD_PERCENT = {cfg['BLOOD_THRESHOLD_PERCENT']}",
+        f"BLOOD_HIGH_PERCENT = {cfg['BLOOD_HIGH_PERCENT']}",
+        f"BLOOD_BLOB_MIN_PERCENT = {cfg['BLOOD_BLOB_MIN_PERCENT']}",
+        f"BLOOD_CONTINUITY = {'true' if cfg['BLOOD_CONTINUITY'] else 'false'}",
+        f"BLOOD_TAGGER_VARIANTS = {'true' if cfg['BLOOD_TAGGER_VARIANTS'] else 'false'}",
+        f"BLOOD_WD_TAGGER = {'true' if cfg['BLOOD_WD_TAGGER'] else 'false'}",
+        f"BLOOD_TAG_CONFIDENCE = {cfg['BLOOD_TAG_CONFIDENCE']}",
+        f"BLOOD_TAGGER_MODEL = {cfg['BLOOD_TAGGER_MODEL']}",
         f"ENABLE_LEWD_CENSOR = {'true' if cfg['ENABLE_LEWD_CENSOR'] else 'false'}",
         f"LEWD_THRESHOLD_PERCENT = {cfg['LEWD_THRESHOLD_PERCENT']}",
         f"SAVE_CENSORED_REVIEW = {'true' if cfg['SAVE_CENSORED_REVIEW'] else 'false'}",
@@ -276,53 +272,286 @@ def save_config(base_dir: str, cfg: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-
-# =============================================================
-# Stage 3: Precision Safety & Censorship Engine
-# =============================================================
-
 def is_colorful(bgr: np.ndarray) -> bool:
-    """Checks if the frame has color (returns False if already black & white)."""
+    """Checks whether a frame contains meaningful color.
+    Greyscale frames bypass the blood-detection pipeline."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mean_saturation = float(hsv[:, :, 1].mean())
     return mean_saturation >= 15.0
 
-def detect_and_censor_blood(bgr: np.ndarray, threshold_pct: float) -> tuple[bool, np.ndarray]:
-    """
-    Checks for heavy blood and gore. If found, converts the frame to grayscale.
-    Uses strict deep-crimson color matching so regular clothes, orange jackets,
-    red ribbons, blush, and normal characters NEVER trigger it.
-    """
-    if not CONFIG["ENABLE_BLOOD_CENSOR"]:
-        return False, bgr
+# These counters summarize the decisions made by the blood filter.
+# The tagger state tracks whether its model is ready or unavailable.
+BLOOD_STATS = {
+    "gate_clear": 0,
+    "instant": 0,
+    "lighting_clear": 0,
+    "tagger_flag": 0,
+    "tagger_clear": 0,
+    "degraded_flag": 0,
+    "continuity": 0,
+}
 
-    if not is_colorful(bgr):
-        return False, bgr
+_LAST_BLOOD_FLAGGED = False
 
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+_TAGGER_STATE = {
+    "ready": False,
+    "failed": False,
+    "session": None,
+    "input_name": None,
+    "blood_idx": -1,
+}
+
+def _crimson_mask(hsv: np.ndarray) -> np.ndarray:
+    """Builds a mask of pixels within the configured crimson range.
+    The mask is used by the first blood-detection filter."""
     h = hsv[:, :, 0]
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
+    crimson1 = (h <= 8) & (s >= 100) & (v >= 25) & (v <= 220)
+    crimson2 = (h >= 172) & (s >= 100) & (v >= 25) & (v <= 220)
+    return crimson1 | crimson2
 
-    crimson1 = (h <= 5) & (s >= 115) & (v >= 25) & (v <= 140)
-    crimson2 = (h >= 175) & (s >= 115) & (v >= 25) & (v <= 140)
-    blood_mask = crimson1 | crimson2
+def _blob_filtered_ratio(crimson: np.ndarray, total_pixels: int, min_blob_px: int) -> float:
+    """Measures the frame area covered by qualifying crimson regions.
+    Small speckles are removed before the percentage is calculated."""
+    if not crimson.any():
+        return 0.0
+    opened = cv2.morphologyEx(
+        (crimson.astype(np.uint8)) * 255, cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8)
+    )
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    kept = 0
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_blob_px:
+            kept += int(stats[i, cv2.CC_STAT_AREA])
+    return (kept / total_pixels) * 100.0
+
+def _augmented_variants(bgr: np.ndarray) -> list:
+    """Creates contrast-adjusted and brightened frame variants.
+    These copies support the optional lighting-normalization check."""
+
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    l_ch = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l_ch)
+    contrast = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+    bright = cv2.convertScaleAbs(bgr, alpha=1.2, beta=60)
+    return [contrast, bright]
+
+def _to_grey(bgr: np.ndarray) -> np.ndarray:
+    """Converts a color frame to greyscale while retaining three channels.
+    Returns the result in OpenCV BGR layout."""
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+def _ensure_onnxruntime() -> bool:
+    """Checks for ONNX Runtime and installs it when missing.
+    Returns whether the semantic blood tagger can be loaded."""
+    try:
+        import onnxruntime
+        return True
+    except ImportError:
+        print("[INFO] Installing onnxruntime (one-time, needed for the WD blood tagger)...")
+        res = subprocess.run([sys.executable, "-m", "pip", "install", "onnxruntime"])
+        if res.returncode != 0:
+            print("[WARN] onnxruntime install failed — Stage C will be skipped (Stage A/B only).")
+            return False
+        try:
+            import onnxruntime
+            return True
+        except ImportError:
+            return False
+
+def _download_model_file(url: str, dest: str) -> bool:
+    """Downloads a model file to a temporary path.
+    Renames it only after the download completes successfully."""
+    part = dest + ".part"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "efioex6/6"})
+        reported = 0
+        with urllib.request.urlopen(req, timeout=120) as resp, open(part, "wb") as out:
+            total = 0
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                total += len(chunk)
+                if total - reported >= 20 * 1024 * 1024:
+                    print(f"    ... downloading model: {total / (1024*1024):.0f} MB")
+                    reported = total
+        os.replace(part, dest)
+        return True
+    except Exception as exc:
+        print(f"[WARN] Model download failed ({exc}) — Stage C will be skipped.")
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+        except OSError:
+            pass
+        return False
+
+def _init_blood_tagger(base_dir: str) -> bool:
+    """Loads the configured WD Tagger model and its tag list.
+    Downloads missing files and records initialization status."""
+    if _TAGGER_STATE["ready"]:
+        return True
+    if _TAGGER_STATE["failed"]:
+        return False
+    if not _ensure_onnxruntime():
+        _TAGGER_STATE["failed"] = True
+        return False
+
+    repo = str(CONFIG.get("BLOOD_TAGGER_MODEL", "SmilingWolf/wd-v1-4-moat-tagger-v2"))
+    model_dir = os.path.join(base_dir, "models", repo.replace("/", "__"))
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "model.onnx")
+    tags_path = os.path.join(model_dir, "selected_tags.csv")
+
+    try:
+        if not os.path.exists(model_path) or os.path.getsize(model_path) < 1024:
+            print(f"[INFO] Downloading WD Tagger model ({repo}) — one-time, cached in models/.")
+            url_base = f"https://huggingface.co/{repo}/resolve/main"
+            if not _download_model_file(f"{url_base}/model.onnx", model_path):
+                _TAGGER_STATE["failed"] = True
+                return False
+            _download_model_file(f"{url_base}/selected_tags.csv", tags_path)
+
+        import onnxruntime as ort
+        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+        blood_idx = -1
+        n_rows = 0
+        with open(tags_path, "r", encoding="utf-8") as f:
+            first_char = f.read(1)
+            f.seek(0)
+            if first_char != "t":
+                raise ValueError("selected_tags.csv is not a valid tag list (downloaded an error page?)")
+            for row_idx, row in enumerate(csv.DictReader(f)):
+                n_rows += 1
+                if row["name"].strip() == "blood" and row["category"].strip() == "0":
+                    blood_idx = row_idx
+        if n_rows < 1000:
+            raise ValueError(f"selected_tags.csv looks truncated ({n_rows} rows)")
+        if blood_idx < 0:
+            print("[WARN] 'blood' tag not found in selected_tags.csv — Stage C disabled.")
+            _TAGGER_STATE["failed"] = True
+            return False
+        out_len = len(session.run(None, {session.get_inputs()[0].name: np.zeros((1, 448, 448, 3), np.float32)})[0][0])
+        if blood_idx >= out_len:
+            raise ValueError(f"blood index {blood_idx} out of range for model output ({out_len})")
+
+        _TAGGER_STATE.update({
+            "ready": True,
+            "session": session,
+            "input_name": session.get_inputs()[0].name,
+            "blood_idx": blood_idx,
+        })
+        print(f"[INFO] WD blood tagger ready ({repo}, cached in models/).")
+        return True
+    except Exception as exc:
+        print(f"[WARN] WD tagger init failed ({exc}) — Stage C will be skipped.")
+        _TAGGER_STATE["failed"] = True
+        return False
+
+def _wd_blood_confidence(bgr: np.ndarray) -> float | None:
+    """Runs one frame through the WD Tagger model.
+    Returns the predicted blood-tag confidence when available."""
+    if not _TAGGER_STATE["ready"]:
+        return None
+    try:
+
+        h, w = bgr.shape[:2]
+        side = max(h, w)
+        canvas = np.full((side, side, 3), 255, dtype=np.uint8)
+        y0, x0 = (side - h) // 2, (side - w) // 2
+        canvas[y0:y0 + h, x0:x0 + w] = bgr
+        resized = cv2.resize(canvas, (448, 448), interpolation=cv2.INTER_AREA)
+        inp = np.expand_dims(resized.astype(np.float32), 0)
+
+        pred = _TAGGER_STATE["session"].run(None, {_TAGGER_STATE["input_name"]: inp})[0][0]
+
+        if pred.min() < 0.0 or pred.max() > 1.0:
+            pred = 1.0 / (1.0 + np.exp(-pred))
+        return float(pred[_TAGGER_STATE["blood_idx"]])
+    except Exception as exc:
+        print(f"[WARN] WD tagger inference failed ({exc}) — treating as unavailable.")
+        _TAGGER_STATE["failed"] = True
+        _TAGGER_STATE["ready"] = False
+        return None
+
+def detect_and_censor_blood(bgr: np.ndarray, threshold_pct: float, base_dir: str = ".") -> tuple[bool, np.ndarray]:
+    """Checks frames for blood using color and semantic filters.
+    Confirmed frames are converted to greyscale with scene continuity handling."""
+    global _LAST_BLOOD_FLAGGED
+    if not CONFIG["ENABLE_BLOOD_CENSOR"]:
+        _LAST_BLOOD_FLAGGED = False
+        return False, bgr
+
+    if not is_colorful(bgr):
+        _LAST_BLOOD_FLAGGED = False
+        return False, bgr
 
     total_pixels = bgr.shape[0] * bgr.shape[1]
-    blood_pixels = int(np.count_nonzero(blood_mask))
-    blood_ratio = (blood_pixels / total_pixels) * 100.0
+    min_blob_px = max(30, int(total_pixels * CONFIG["BLOOD_BLOB_MIN_PERCENT"] / 100.0))
 
-    if blood_ratio >= threshold_pct:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        grey_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        return True, grey_bgr
+    if CONFIG.get("BLOOD_CONTINUITY", True) and _LAST_BLOOD_FLAGGED:
+        cont_ratio = _blob_filtered_ratio(_crimson_mask(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)),
+                                          total_pixels, min_blob_px)
+        if cont_ratio >= 0.1:
+            BLOOD_STATS["continuity"] += 1
+            _LAST_BLOOD_FLAGGED = True
+            return True, _to_grey(bgr)
 
+    gate_ratio = _blob_filtered_ratio(_crimson_mask(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)),
+                                      total_pixels, min_blob_px)
+    if gate_ratio < threshold_pct:
+        BLOOD_STATS["gate_clear"] += 1
+        _LAST_BLOOD_FLAGGED = False
+        return False, bgr
+
+    votes = 0
+    if CONFIG["BLOOD_TAGGER_VARIANTS"]:
+        for variant in _augmented_variants(bgr):
+            v_ratio = _blob_filtered_ratio(_crimson_mask(cv2.cvtColor(variant, cv2.COLOR_BGR2HSV)),
+                                           total_pixels, min_blob_px)
+            if v_ratio >= threshold_pct:
+                votes += 1
+        if votes == 0:
+
+            BLOOD_STATS["lighting_clear"] += 1
+            _LAST_BLOOD_FLAGGED = False
+            return False, bgr
+    else:
+        votes = 2
+
+    if CONFIG["BLOOD_WD_TAGGER"] and _init_blood_tagger(base_dir):
+        confidence = _wd_blood_confidence(bgr)
+        if confidence is not None:
+            if confidence >= CONFIG["BLOOD_TAG_CONFIDENCE"]:
+                BLOOD_STATS["tagger_flag"] += 1
+                _LAST_BLOOD_FLAGGED = True
+                return True, _to_grey(bgr)
+            BLOOD_STATS["tagger_clear"] += 1
+            _LAST_BLOOD_FLAGGED = False
+            return False, bgr
+
+    if gate_ratio >= CONFIG["BLOOD_HIGH_PERCENT"]:
+        BLOOD_STATS["instant"] += 1
+        _LAST_BLOOD_FLAGGED = True
+        return True, _to_grey(bgr)
+    if votes >= 2:
+        BLOOD_STATS["degraded_flag"] += 1
+        _LAST_BLOOD_FLAGGED = True
+        return True, _to_grey(bgr)
+    BLOOD_STATS["tagger_clear"] += 1
+    _LAST_BLOOD_FLAGGED = False
     return False, bgr
 
 def detect_and_censor_lewd(bgr: np.ndarray, threshold_pct: float) -> tuple[bool, np.ndarray]:
-    """
-    Checks for large exposed body skin regions and applies Gaussian blur to the sensitive area.
-    """
+    """Detects large skin-colored regions and blurs qualifying areas.
+    Returns whether censorship was applied and the processed frame."""
     if not CONFIG["ENABLE_LEWD_CENSOR"]:
         return False, bgr
 
@@ -351,13 +580,9 @@ def detect_and_censor_lewd(bgr: np.ndarray, threshold_pct: float) -> tuple[bool,
 
     return modified, result_bgr
 
-
-# =============================================================
-# Stage 1: Motion, Pan, and Fade Detection
-# =============================================================
-
 def is_truly_black(gray: np.ndarray) -> bool:
-    """Strict black check: ensures 98%+ of pixels are under 8 luma."""
+    """Detects frames that are almost entirely black.
+    Uses the configured luma limit and black-pixel percentage."""
     threshold = CONFIG["BLACK_PIXEL_MAX_LUMA"]
     req_pct = CONFIG["BLACK_PIXEL_PERCENT"]
     black_pixels = np.count_nonzero(gray <= threshold)
@@ -365,11 +590,8 @@ def is_truly_black(gray: np.ndarray) -> bool:
     return pct >= req_pct
 
 def analyze_grid_difference(prev_gray: np.ndarray, curr_gray: np.ndarray) -> tuple[float, float]:
-    """
-    Splits frames into a 16x16 grid of cells to detect local micro-animations
-    (like eye blinks and mouth movements) vs pure still images.
-    Returns: (max_cell_change, overall_mean_change)
-    """
+    """Compares two frames across a 16-by-16 grid.
+    Returns the strongest local change and the overall average difference."""
     diff = cv2.absdiff(prev_gray, curr_gray)
     h, w = diff.shape
     rows, cols = 16, 16
@@ -387,11 +609,8 @@ def analyze_grid_difference(prev_gray: np.ndarray, curr_gray: np.ndarray) -> tup
     return max_cell, overall
 
 def is_fading_transition(prev_gray: np.ndarray, curr_gray: np.ndarray) -> bool:
-    """
-    Detects if the difference between two frames is a fade (brightness change)
-    rather than an actual animated motion.
-    Covers black fades, white fades, and text fades on static backgrounds.
-    """
+    """Checks whether a frame change resembles a brightness fade.
+    Compares luminance shifts against normalized structural differences."""
     luma_prev = float(prev_gray.mean())
     luma_curr = float(curr_gray.mean())
     luma_shift = abs(luma_curr - luma_prev)
@@ -406,7 +625,8 @@ def is_fading_transition(prev_gray: np.ndarray, curr_gray: np.ndarray) -> bool:
     return struct_diff <= 0.22
 
 def estimate_pan_transform(prev_gray: np.ndarray, curr_gray: np.ndarray):
-    """Calculates camera motion using ORB feature matching."""
+    """Estimates camera movement between frames using ORB features.
+    Returns the transform and its matching inlier ratio."""
     orb = cv2.ORB_create(nfeatures=400)
     kp_a, desc_a = orb.detectAndCompute(prev_gray, None)
     kp_b, desc_b = orb.detectAndCompute(curr_gray, None)
@@ -430,7 +650,8 @@ def estimate_pan_transform(prev_gray: np.ndarray, curr_gray: np.ndarray):
     return transform, inlier_ratio
 
 def compute_pan_residual(prev_gray: np.ndarray, curr_gray: np.ndarray, transform: np.ndarray) -> float:
-    """Verifies that the transformed frame matches the current frame (pure camera move)."""
+    """Measures visual difference after aligning a frame to its predecessor.
+    A low residual indicates that the change is mostly camera movement."""
     h, w = curr_gray.shape
     aligned = cv2.warpPerspective(prev_gray, transform, (w, h))
     coverage = cv2.warpPerspective(np.full_like(prev_gray, 255), transform, (w, h))
@@ -443,25 +664,28 @@ def compute_pan_residual(prev_gray: np.ndarray, curr_gray: np.ndarray, transform
         return 100.0
     return (float(changed.sum()) / valid_count) * 100.0
 
-
-# =============================================================
-# Buffers: Pan Buffer & Fade Buffer
-# =============================================================
-
 class FadeBuffer:
-    """Buffers consecutive fading frames and strictly limits them to max_frames (5 max)."""
+    """Collects consecutive fade-transition frames.
+    Keeps up to the configured maximum across the transition."""
     def __init__(self, max_frames: int = 5):
+        """Initializes the fade-frame limit and an empty buffer.
+        The limit controls how many frames survive a transition."""
         self.max_frames = max_frames
         self.buffer = []
 
     def add(self, frame_data: dict) -> None:
+        """Adds a frame to the pending fade sequence.
+        Frames are selected when the buffer is flushed."""
         self.buffer.append(frame_data)
 
     def is_empty(self) -> bool:
+        """Reports whether the fade buffer contains pending frames.
+        Used before deciding whether the buffer needs flushing."""
         return len(self.buffer) == 0
 
     def flush(self) -> list[dict]:
-        """Limits the fade transition to at most max_frames distributed from 0% to 100%."""
+        """Selects representative frames from the pending fade sequence.
+        Returns no more than the configured maximum and clears the buffer."""
         if not self.buffer:
             return []
 
@@ -477,21 +701,28 @@ class FadeBuffer:
         self.buffer = []
         return kept
 
-
 class PanBuffer:
-    """Buffers consecutive panning frames and keeps only 3 points if duration >= 2s."""
+    """Collects frames while a camera pan is detected.
+    Long pans are reduced to start, middle, and end samples."""
     def __init__(self, min_seconds: float):
+        """Stores the minimum pan duration and creates an empty buffer.
+        Short pans can retain all of their frames."""
         self.min_seconds = min_seconds
         self.buffer = []
 
     def add(self, frame_data: dict) -> None:
+        """Adds a frame to the pending camera-pan sequence.
+        The sequence is evaluated when the pan ends."""
         self.buffer.append(frame_data)
 
     def is_empty(self) -> bool:
+        """Reports whether the pan buffer contains pending frames.
+        Used before deciding whether the buffer needs flushing."""
         return len(self.buffer) == 0
 
     def flush(self) -> list[dict]:
-        """Processes buffered frames when a pan ends. Returns list of frames to keep."""
+        """Selects frames to represent the completed camera pan.
+        Long pans keep three samples; shorter pans keep their frames."""
         if not self.buffer:
             return []
 
@@ -518,16 +749,9 @@ class PanBuffer:
         self.buffer = []
         return kept
 
-
-# =============================================================
-# Stage 2: Cyclical & Talking Loop Filter
-# =============================================================
-
 def filter_cyclical_loops(base_dir: str, survivors: list[dict], frames_dir: str, window_size: int = 60) -> list[dict]:
-    """
-    Scans survivor frames for repeating animation loops (like talking mouth flaps or idle swaying).
-    Keeps P unique frames distributed across 0% to 100% of the speech timeline, dropping redundant cycles.
-    """
+    """Finds repeated animation cycles among surviving frames.
+    Removes redundant cycles while preserving representative poses over time."""
     total_survivors = len(survivors)
     if total_survivors < 10:
         return survivors
@@ -643,13 +867,9 @@ def filter_cyclical_loops(base_dir: str, survivors: list[dict], frames_dir: str,
     print(f"[INFO] Stage 2 Complete! Clean survivors remaining: {len(new_survivors)} frames.")
     return new_survivors
 
-
-# =============================================================
-# Subtitle Auto-Detection & Burning
-# =============================================================
-
 def find_english_sub_stream(video_path: str) -> int:
-    """Finds the English subtitle stream index in the MKV."""
+    """Finds a usable English subtitle stream in the video.
+    Falls back to the first available text subtitle stream."""
     try:
         cmd = [
             "ffprobe", "-v", "error", "-select_streams", "s",
@@ -688,78 +908,587 @@ def find_english_sub_stream(video_path: str) -> int:
         return -1
 
 def escape_sub_path(path: str) -> str:
-    """Escapes paths for FFmpeg subtitle filter."""
+    """Escapes a subtitle file path for FFmpeg filter syntax.
+    Applies Windows-specific path handling when required."""
     if platform.system() == "Windows":
         path = path.replace("\\", "/").replace(":", "\\:")
     return path.replace("'", "'\\''")
 
-def burn_subtitles(base_dir: str, video_path: str, survivors: list[dict], sub_stream: int, use_gpu: bool) -> None:
-    """Burns subtitles into commentsubs/ matching frames/ 1-to-1."""
-    if sub_stream < 0 or not survivors:
-        print("[INFO] No subtitle stream found or no survivors. Skipping commentsubs.")
-        return
-
-    ass_path = os.path.join(base_dir, "subs_extracted.ass")
-    timing_path = os.path.join(base_dir, "subs_timing_list.txt")
-    subs_dir = os.path.join(base_dir, "commentsubs")
-
-    print("[INFO] Extracting subtitle track...")
-    cmd_extract = [
-        "ffmpeg", "-hide_banner", "-y", "-i", video_path,
-        "-map", f"0:s:{sub_stream}", "-c:s", "ass", ass_path
-    ]
-    res = subprocess.run(cmd_extract, capture_output=True)
-    if res.returncode != 0:
-        print("[WARN] Could not extract subtitle stream. Skipping commentsubs.")
-        return
-
-    print(f"[INFO] Building timing map for {len(survivors)} survivor frames...")
-    lines = ["ffconcat version 1.0"]
-    for i in range(len(survivors) - 1):
-        num_a = survivors[i]["final_number"]
-        t_a = survivors[i]["time_s"] or 0.0
-        t_b = survivors[i+1]["time_s"] or (t_a + 0.04)
-        duration = max(0.001, t_b - t_a)
-        lines.append(f"file 'frames/frame_{num_a}.jpg'")
-        lines.append(f"duration {duration:.6f}")
-
-    last_num = survivors[-1]["final_number"]
-    lines.append(f"file 'frames/frame_{last_num}.jpg'")
-    lines.append("duration 0.041667")
-
-    with open(timing_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
+def burn_subtitles(
+    base_dir: str,
+    video_path: str,
+    survivors: list[dict],
+    sub_stream: int,
+    use_gpu: bool,
+    output_dir: str | None = None,
+    work_dir: str | None = None,
+) -> bool:
+    """Burns the source subtitle stream into the current frame sequence.
+    Can write to a staging folder so existing commentsubs remain recoverable."""
+    subs_dir = output_dir or os.path.join(base_dir, "commentsubs")
     os.makedirs(subs_dir, exist_ok=True)
-    start_t = survivors[0]["time_s"] or 0.0
-    vf = f"setpts=PTS+{start_t:.6f}/TB,subtitles='{escape_sub_path(ass_path)}'"
 
-    print(f"[INFO] Burning subtitles into {len(survivors)} frames in commentsubs/...")
-    cmd_burn = ["ffmpeg", "-hide_banner", "-y"]
-    if use_gpu:
-        cmd_burn.extend(["-hwaccel", "auto"])
-    cmd_burn.extend([
-        "-f", "concat", "-safe", "0", "-i", timing_path,
-        "-vf", vf,
-        "-vsync", "passthrough",
-        "-q:v", str(CONFIG["QUALITY_SUBS"]),
-        os.path.join(subs_dir, "frame_%d.jpg")
-    ])
-    subprocess.run(cmd_burn, capture_output=True)
+    if sub_stream < 0 or not survivors:
+        print("[INFO] No subtitle stream found or no frames available. commentsubs will be empty.")
+        return True
 
-    for p in (ass_path, timing_path):
-        if os.path.exists(p):
-            os.remove(p)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("[ERROR] FFmpeg was not found in PATH.")
+        return False
 
-    print(f"[INFO] Subtitles burned successfully to commentsubs/ ({len(survivors)} frames).")
+    work_dir = work_dir or base_dir
+    os.makedirs(work_dir, exist_ok=True)
+    ass_path = os.path.join(work_dir, "subs_extracted.ass")
+    timing_path = os.path.join(work_dir, "subs_timing_list.txt")
+
+    try:
+        for survivor in survivors:
+            number = int(survivor["final_number"])
+            frame_path = os.path.join(base_dir, "frames", f"frame_{number}.jpg")
+            if not os.path.isfile(frame_path):
+                print(f"[ERROR] Missing frame_{number}.jpg; subtitle rebuilding was stopped.")
+                return False
+
+        print("[INFO] Extracting subtitle track...")
+        cmd_extract = [
+            ffmpeg, "-hide_banner", "-y", "-i", video_path,
+            "-map", f"0:s:{sub_stream}", "-c:s", "ass", ass_path
+        ]
+        extract_result = subprocess.run(cmd_extract, capture_output=True, text=True, cwd=base_dir)
+        if extract_result.returncode != 0 or not os.path.isfile(ass_path):
+            detail = (extract_result.stderr or "").strip().splitlines()
+            print("[WARN] Could not extract the selected subtitle stream.")
+            if detail:
+                print(f"       {detail[-1]}")
+            return False
+
+        lines = ["ffconcat version 1.0"]
+        for index, item in enumerate(survivors[:-1]):
+            number = int(item["final_number"])
+            time_a = float(item["time_s"])
+            time_b = float(survivors[index + 1]["time_s"])
+            duration = max(0.001, time_b - time_a)
+            frame_path = os.path.abspath(os.path.join(base_dir, "frames", f"frame_{number}.jpg"))
+            manifest_path = os.path.relpath(frame_path, os.path.dirname(timing_path)).replace("\\", "/")
+            manifest_path = manifest_path.replace("'", "'\\''")
+            lines.append(f"file '{manifest_path}'")
+            lines.append(f"duration {duration:.9f}")
+        last_number = int(survivors[-1]["final_number"])
+        last_frame_path = os.path.abspath(os.path.join(base_dir, "frames", f"frame_{last_number}.jpg"))
+        last_manifest_path = os.path.relpath(last_frame_path, os.path.dirname(timing_path)).replace("\\", "/")
+        last_manifest_path = last_manifest_path.replace("'", "'\\''")
+        lines.append(f"file '{last_manifest_path}'")
+        lines.append("duration 0.041667")
+
+        with open(timing_path, "w", encoding="utf-8", newline="\n") as file:
+            file.write("\n".join(lines) + "\n")
+
+        os.makedirs(subs_dir, exist_ok=True)
+        start_time = float(survivors[0]["time_s"])
+        subtitle_filter = f"setpts=PTS+{start_time:.9f}/TB,subtitles='{escape_sub_path(ass_path)}'"
+        print(f"[INFO] Burning subtitles into {len(survivors):,} frames...")
+
+        cmd_burn = [ffmpeg, "-hide_banner", "-y"]
+        if use_gpu:
+            cmd_burn.extend(["-hwaccel", "auto"])
+        cmd_burn.extend([
+            "-f", "concat", "-safe", "0", "-i", timing_path,
+            "-vf", subtitle_filter,
+            "-vsync", "passthrough",
+            "-q:v", str(CONFIG["QUALITY_SUBS"]),
+            os.path.join(subs_dir, "frame_%d.jpg")
+        ])
+        burn_result = subprocess.run(cmd_burn, capture_output=True, text=True, cwd=base_dir)
+        if burn_result.returncode != 0:
+            detail = (burn_result.stderr or "").strip().splitlines()
+            print("[ERROR] FFmpeg failed while burning subtitles.")
+            if detail:
+                print(f"       {detail[-1]}")
+            return False
+
+        output_pattern = re.compile(r"^frame_(\d+)\.jpg$", re.IGNORECASE)
+        output_numbers = sorted(
+            int(match.group(1))
+            for name in os.listdir(subs_dir)
+            if (match := output_pattern.match(name))
+        )
+        expected_numbers = list(range(1, len(survivors) + 1))
+        if output_numbers != expected_numbers:
+            print(f"[ERROR] Subtitle output is incomplete: expected {len(expected_numbers)} images, generated {len(output_numbers)}.")
+            return False
+
+        print(f"[INFO] Subtitle images generated successfully ({len(output_numbers):,} frames).")
+        return True
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"[ERROR] Subtitle generation failed: {exc}")
+        return False
+    finally:
+        for temporary_path in (ass_path, timing_path):
+            if os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+
+def _format_missing_ranges(numbers: list[int]) -> str:
+    """Groups missing frame numbers into compact ranges.
+    Returns a readable summary for the repair confirmation prompt."""
+    if not numbers:
+        return "None"
+    ranges = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(ranges)
 
 
-# =============================================================
-# Video File Discovery & Selection
-# =============================================================
+def _load_repair_metadata(base_dir: str, frame_numbers: set[int]) -> tuple[dict | list | None, dict | None, set[int]]:
+    """Loads timestamp sidecars and prepares their renumbered contents.
+    Retains original source times while removing entries for missing images."""
+    precise_path = os.path.join(base_dir, "frame_timestamps.json")
+    simple_path = os.path.join(base_dir, "timestamps.json")
+    precise_data = None
+    simple_data = None
+    expected_numbers = set(frame_numbers)
+
+    if os.path.isfile(precise_path):
+        with open(precise_path, "r", encoding="utf-8") as file:
+            precise_data = json.load(file)
+        entries = precise_data.get("frames", []) if isinstance(precise_data, dict) else precise_data
+        if not isinstance(entries, list):
+            raise ValueError("frame_timestamps.json has an unsupported format.")
+        metadata_numbers = []
+        for item in entries:
+            number = int(item["frame"])
+            timestamp = float(item["time_s"])
+            if number < 1 or not np.isfinite(timestamp) or timestamp < 0:
+                raise ValueError("frame_timestamps.json contains an invalid entry.")
+            metadata_numbers.append(number)
+        if len(metadata_numbers) != len(set(metadata_numbers)):
+            raise ValueError("frame_timestamps.json contains duplicate frame numbers.")
+        expected_numbers.update(metadata_numbers)
+
+    if os.path.isfile(simple_path):
+        with open(simple_path, "r", encoding="utf-8") as file:
+            simple_data = json.load(file)
+        if not isinstance(simple_data, dict):
+            raise ValueError("timestamps.json has an unsupported format.")
+        for key in simple_data:
+            if str(key).isdigit():
+                expected_numbers.add(int(key))
+
+    upper_bound = max(expected_numbers, default=0)
+    missing_numbers = set(range(1, upper_bound + 1)) - frame_numbers
+    return precise_data, simple_data, missing_numbers
+
+
+def repair_frames(base_dir: str) -> bool:
+    """Compacts the surviving frames and remaps matching review images.
+    Preserves original timestamps and leaves commentsubs for Finalize to rebuild."""
+    frames_dir = os.path.join(base_dir, "frames")
+    if not os.path.isdir(frames_dir):
+        print("  [ERROR] frames/ was not found. Run extraction first.")
+        return False
+
+    frame_pattern = re.compile(r"^frame_(\d+)\.jpg$", re.IGNORECASE)
+    frame_paths: dict[int, str] = {}
+    for filename in os.listdir(frames_dir):
+        match = frame_pattern.match(filename)
+        if not match:
+            continue
+        number = int(match.group(1))
+        if number in frame_paths:
+            print(f"  [ERROR] Multiple files use frame number {number}.")
+            print("  Rename the duplicate manually before finalizing.")
+            return False
+        frame_paths[number] = os.path.join(frames_dir, filename)
+
+    if not frame_paths:
+        print("  [ERROR] No frame_N.jpg files were found in frames/.")
+        return False
+
+    original_numbers = sorted(frame_paths)
+    try:
+        precise_data, simple_data, missing_map = _load_repair_metadata(base_dir, set(original_numbers))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        print(f"  [ERROR] Could not read timestamp metadata: {exc}")
+        print("  No files were changed.")
+        return False
+
+    missing_numbers = sorted(missing_map)
+    old_to_new = {old_number: new_number for new_number, old_number in enumerate(original_numbers, 1)}
+    changed_count = sum(old != new for old, new in old_to_new.items())
+    review_dir = os.path.join(base_dir, "censored_review")
+    legacy_review_names = False
+    if os.path.isdir(review_dir):
+        legacy_review_names = any(
+            re.match(r"^frame_\d+_original\.jpg$", name, re.IGNORECASE)
+            for name in os.listdir(review_dir)
+        )
+
+    if not missing_numbers and changed_count == 0 and not legacy_review_names:
+        print(f"\n  [INFO] frames/ is already continuous ({len(original_numbers):,} frames).")
+        print("  No renumbering is necessary.")
+        return True
+
+    print("\n  ── Frame Repair Preview ─────────────────────────────")
+    print(f"  Existing frames:  {len(original_numbers):,}")
+    print(f"  Missing numbers:  {_format_missing_ranges(missing_numbers)}")
+    print(f"  Frames after repair: {len(original_numbers):,} (renumbered from 1)")
+    print("  Matching censored-review images will receive the same new numbers.")
+    confirm = input("\n  Repair and renumber these frames? (y/n): ").strip().lower()
+    if confirm != "y":
+        print("  Finalize cancelled before changing files.")
+        return False
+
+    plan: list[tuple[str, str, str]] = []
+    staged_root = None
+    moved_to_stage: list[tuple[str, str, str]] = []
+    moved_to_destination: list[tuple[str, str, str]] = []
+    metadata_originals: dict[str, bytes] = {}
+    metadata_replacements: dict[str, object] = {}
+    precise_entries_after = None
+
+    try:
+        for old_number, source_path in frame_paths.items():
+            new_number = old_to_new[old_number]
+            destination_path = os.path.join(frames_dir, f"frame_{new_number}.jpg")
+            if os.path.normcase(os.path.abspath(source_path)) != os.path.normcase(os.path.abspath(destination_path)):
+                plan.append((source_path, "frames", destination_path))
+
+        review_pattern = re.compile(r"^frame_(\d+)(?:_original)?\.jpg$", re.IGNORECASE)
+        if os.path.isdir(review_dir):
+            for filename in os.listdir(review_dir):
+                match = review_pattern.match(filename)
+                if not match:
+                    continue
+                old_number = int(match.group(1))
+                source_path = os.path.join(review_dir, filename)
+                if old_number in old_to_new:
+                    destination_name = f"frame_{old_to_new[old_number]}.jpg"
+                else:
+                    orphan_name = f"orphan_{filename}"
+                    destination_name = orphan_name
+                    suffix = 2
+                    while os.path.exists(os.path.join(review_dir, destination_name)):
+                        stem, extension = os.path.splitext(orphan_name)
+                        destination_name = f"{stem}_{suffix}{extension}"
+                        suffix += 1
+                destination_path = os.path.join(review_dir, destination_name)
+                if os.path.normcase(os.path.abspath(source_path)) != os.path.normcase(os.path.abspath(destination_path)):
+                    plan.append((source_path, "censored_review", destination_path))
+
+        normalized_destinations = [os.path.normcase(os.path.abspath(item[2])) for item in plan]
+        if len(normalized_destinations) != len(set(normalized_destinations)):
+            raise RuntimeError("Multiple review images would map to the same frame number. Resolve duplicate review images first.")
+
+        source_paths = {os.path.normcase(os.path.abspath(item[0])) for item in plan}
+        for source_path, _, destination_path in plan:
+            destination_key = os.path.normcase(os.path.abspath(destination_path))
+            if os.path.exists(destination_path) and destination_key not in source_paths:
+                raise RuntimeError(f"Repair would overwrite an unrelated file: {destination_path}")
+
+        if precise_data is not None:
+            precise_path = os.path.join(base_dir, "frame_timestamps.json")
+            old_entries = precise_data.get("frames", []) if isinstance(precise_data, dict) else precise_data
+            new_entries = []
+            for item in old_entries:
+                old_number = int(item["frame"])
+                if old_number in old_to_new:
+                    updated = dict(item)
+                    updated["frame"] = old_to_new[old_number]
+                    new_entries.append(updated)
+            new_entries.sort(key=lambda item: int(item["frame"]))
+            precise_entries_after = len(new_entries)
+            if isinstance(precise_data, dict):
+                updated_precise = dict(precise_data)
+                updated_precise["frames"] = new_entries
+            else:
+                updated_precise = new_entries
+            metadata_replacements[precise_path] = updated_precise
+
+        if simple_data is not None:
+            simple_path = os.path.join(base_dir, "timestamps.json")
+            updated_simple = {key: value for key, value in simple_data.items() if not str(key).isdigit()}
+            remapped_values = {}
+            for old_key, value in simple_data.items():
+                if str(old_key).isdigit() and int(old_key) in old_to_new:
+                    remapped_values[str(old_to_new[int(old_key)])] = value
+            updated_simple.update(remapped_values)
+            metadata_replacements[simple_path] = dict(sorted(
+                updated_simple.items(),
+                key=lambda item: (0, int(item[0])) if str(item[0]).isdigit() else (1, str(item[0]))
+            ))
+
+        staged_root = tempfile.mkdtemp(prefix=".efioex6_frame_repair_", dir=base_dir)
+        stage_paths = []
+        for index, (source_path, folder_name, destination_path) in enumerate(plan):
+            stage_path = os.path.join(staged_root, f"file_{index:08d}.tmp")
+            stage_paths.append((source_path, stage_path, destination_path))
+
+        for source_path, stage_path, destination_path in stage_paths:
+            shutil.move(source_path, stage_path)
+            moved_to_stage.append((source_path, stage_path, destination_path))
+
+        for source_path, stage_path, destination_path in stage_paths:
+            shutil.move(stage_path, destination_path)
+            moved_to_destination.append((source_path, stage_path, destination_path))
+
+        for metadata_path, replacement in metadata_replacements.items():
+            with open(metadata_path, "rb") as file:
+                metadata_originals[metadata_path] = file.read()
+            temporary_path = os.path.join(staged_root, os.path.basename(metadata_path) + ".new")
+            with open(temporary_path, "w", encoding="utf-8") as file:
+                json.dump(replacement, file, indent=2)
+                file.write("\n")
+            os.replace(temporary_path, metadata_path)
+
+        print("\n  [SUCCESS] Frame numbering repaired.")
+        print(f"  Frames retained: {len(original_numbers):,}")
+        print(f"  Missing frame numbers removed: {len(missing_numbers):,}")
+        print(f"  New sequence: frame_1.jpg through frame_{len(original_numbers)}.jpg")
+        review_count = sum(1 for _, folder, _ in plan if folder == "censored_review")
+        orphan_count = sum(
+            1 for _, folder, destination in plan
+            if folder == "censored_review" and os.path.basename(destination).startswith("orphan_")
+        )
+        if review_count:
+            print(f"  Censored-review images renamed: {review_count:,}")
+        if orphan_count:
+            print(f"  Unmatched review images preserved as orphans: {orphan_count:,}")
+        if precise_data is None:
+            print("  [WARN] frame_timestamps.json was not found.")
+        elif precise_entries_after is not None and precise_entries_after < len(original_numbers):
+            print(f"  [WARN] {len(original_numbers) - precise_entries_after} surviving frames have no precise timestamp entry.")
+        print("  Original source timestamps were retained.")
+        return True
+
+    except Exception as exc:
+        for metadata_path, original_bytes in metadata_originals.items():
+            try:
+                restore_path = metadata_path + ".restore"
+                with open(restore_path, "wb") as file:
+                    file.write(original_bytes)
+                os.replace(restore_path, metadata_path)
+            except OSError:
+                pass
+
+        if moved_to_destination and staged_root:
+            for source_path, stage_path, destination_path in reversed(moved_to_destination):
+                try:
+                    if os.path.exists(destination_path):
+                        shutil.move(destination_path, stage_path)
+                except OSError:
+                    pass
+        if moved_to_stage:
+            for source_path, stage_path, destination_path in reversed(moved_to_stage):
+                try:
+                    if os.path.exists(stage_path):
+                        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+                        shutil.move(stage_path, source_path)
+                except OSError:
+                    pass
+        print(f"\n  [ERROR] Frame repair failed: {exc}")
+        print("  The program attempted to restore original filenames and metadata.")
+        return False
+    finally:
+        if staged_root and os.path.isdir(staged_root):
+            shutil.rmtree(staged_root, ignore_errors=True)
+
+
+def _read_frame_timeline(base_dir: str) -> tuple[list[dict], dict]:
+    """Validates numbered frames against their precise timestamp sidecar.
+    Returns one chronological record for every image in the folder."""
+    frames_dir = os.path.join(base_dir, "frames")
+    timestamp_path = os.path.join(base_dir, "frame_timestamps.json")
+    if not os.path.isdir(frames_dir):
+        raise ValueError("frames/ was not found.")
+    if not os.path.isfile(timestamp_path):
+        raise ValueError("frame_timestamps.json was not found. Run extraction with this version first.")
+
+    pattern = re.compile(r"^frame_(\d+)\.jpg$", re.IGNORECASE)
+    frame_numbers = sorted(
+        int(match.group(1))
+        for name in os.listdir(frames_dir)
+        if (match := pattern.match(name))
+    )
+    if not frame_numbers:
+        raise ValueError("No frame_N.jpg images were found in frames/.")
+    expected = list(range(1, len(frame_numbers) + 1))
+    if frame_numbers != expected:
+        missing = sorted(set(expected) - set(frame_numbers))
+        extra = sorted(set(frame_numbers) - set(expected))
+        details = []
+        if missing:
+            details.append(f"missing frame numbers: {_format_missing_ranges(missing)}")
+        if extra:
+            details.append(f"unexpected frame numbers: {extra[:12]}")
+        raise ValueError("Frame numbering is not continuous (" + "; ".join(details) + "). Run Finalize first.")
+
+    with open(timestamp_path, "r", encoding="utf-8") as file:
+        timestamp_data = json.load(file)
+    if isinstance(timestamp_data, dict):
+        entries = timestamp_data.get("frames", [])
+    elif isinstance(timestamp_data, list):
+        entries = timestamp_data
+        timestamp_data = {"frames": entries}
+    else:
+        raise ValueError("frame_timestamps.json has an unsupported format.")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("frame_timestamps.json contains no frame records.")
+
+    by_number = {}
+    for item in entries:
+        number = int(item["frame"])
+        time_s = float(item["time_s"])
+        if number < 1 or not np.isfinite(time_s) or time_s < 0:
+            raise ValueError("frame_timestamps.json contains an invalid frame number or time.")
+        if number in by_number:
+            raise ValueError(f"frame_timestamps.json contains duplicate frame_{number} entries.")
+        by_number[number] = time_s
+
+    if sorted(by_number) != expected:
+        missing_times = sorted(set(expected) - set(by_number))
+        missing_images = sorted(set(by_number) - set(expected))
+        details = []
+        if missing_times:
+            details.append(f"frames without timestamps: {missing_times[:12]}")
+        if missing_images:
+            details.append(f"timestamps without frames: {missing_images[:12]}")
+        raise ValueError("Frame files and timestamp metadata do not match (" + "; ".join(details) + "). Run Finalize first.")
+
+    survivors = [{"final_number": number, "time_s": by_number[number]} for number in expected]
+    times = [item["time_s"] for item in survivors]
+    if any(current <= previous for previous, current in zip(times, times[1:])):
+        raise ValueError("Frame timestamps are not strictly increasing. Run Finalize or inspect the timestamp file.")
+
+    for number in expected:
+        image_path = os.path.join(frames_dir, f"frame_{number}.jpg")
+        if not os.path.isfile(image_path):
+            raise ValueError(f"Missing generated image: frame_{number}.jpg")
+    return survivors, timestamp_data
+
+
+def finalize_manual_changes(base_dir: str) -> None:
+    """Repairs user-edited frame numbering and rebuilds subtitle images.
+    Keeps the reconstructed preview as a separate, optional operation."""
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        print("  [ERROR] FFmpeg and FFprobe must both be available in PATH.")
+        return
+
+    timestamp_path = os.path.join(base_dir, "frame_timestamps.json")
+    if not os.path.isfile(timestamp_path):
+        print("  [ERROR] frame_timestamps.json was not found. Run extraction with this version first.")
+        return
+    try:
+        with open(timestamp_path, "r", encoding="utf-8") as file:
+            timestamp_data = json.load(file)
+        if not isinstance(timestamp_data, dict):
+            raise ValueError("Unsupported timestamp metadata format.")
+        saved_source = timestamp_data.get("source_video")
+        if not saved_source:
+            raise ValueError("The timestamp metadata does not identify its source video.")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"  [ERROR] Could not identify the source video: {exc}")
+        return
+
+    saved_path = saved_source if os.path.isabs(saved_source) else os.path.join(base_dir, saved_source)
+    if os.path.isfile(saved_path):
+        video_path = os.path.abspath(saved_path)
+        print(f"  [INFO] Using extraction source: {os.path.basename(video_path)}")
+    else:
+        print(f"  [WARN] Extraction source was not found: {saved_source}")
+        selected = select_video_file(base_dir)
+        if not selected:
+            return
+        video_path = selected if os.path.isabs(selected) else os.path.join(base_dir, selected)
+        video_path = os.path.abspath(video_path)
+
+    if os.path.normcase(os.path.basename(saved_source)) != os.path.normcase(os.path.basename(video_path)):
+        print(f"  [WARN] These frames were extracted from: {saved_source}")
+        print(f"  Selected subtitle source: {os.path.basename(video_path)}")
+        confirm_source = input("  Rebuild subtitles using this different source? (y/n): ").strip().lower()
+        if confirm_source != "y":
+            print("  Finalize cancelled.")
+            return
+
+    print("\n  ── Finalize Manual Changes ─────────────────────────")
+    print("  1. Repair and renumber surviving frames.")
+    print("  2. Keep each surviving frame's original source timestamp.")
+    print("  3. Rebuild commentsubs/ from the corrected frames.")
+    print("  This does not rerun extraction, censorship, or video reconstruction.")
+
+    if not repair_frames(base_dir):
+        return
+
+    try:
+        survivors, updated_timestamp_data = _read_frame_timeline(base_dir)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        print(f"\n  [ERROR] Finalize cannot safely rebuild commentsubs: {exc}")
+        print("  The frame repair may have completed, but subtitle output was left untouched.")
+        return
+
+    sub_stream = int(CONFIG.get("SUBTITLE_STREAM", -1))
+    if sub_stream < 0:
+        sub_stream = find_english_sub_stream(video_path)
+
+    staging_root = tempfile.mkdtemp(prefix=".efioex6_finalize_", dir=base_dir)
+    staged_commentsubs = os.path.join(staging_root, "commentsubs")
+    os.makedirs(staged_commentsubs, exist_ok=True)
+    try:
+        success = burn_subtitles(
+            base_dir,
+            video_path,
+            survivors,
+            sub_stream,
+            False,
+            output_dir=staged_commentsubs,
+            work_dir=staging_root,
+        )
+        if not success:
+            print("  [ERROR] commentsubs/ was not replaced. The previous folder was preserved.")
+            return
+
+        commentsubs_path = os.path.join(base_dir, "commentsubs")
+        backup_path = os.path.join(base_dir, ".efioex6_commentsubs_backup")
+        if os.path.exists(backup_path):
+            shutil.rmtree(backup_path, ignore_errors=True)
+        had_previous = os.path.exists(commentsubs_path)
+        if had_previous:
+            os.replace(commentsubs_path, backup_path)
+        try:
+            os.replace(staged_commentsubs, commentsubs_path)
+        except Exception:
+            if had_previous and os.path.exists(backup_path):
+                os.replace(backup_path, commentsubs_path)
+            raise
+        if os.path.isdir(backup_path):
+            shutil.rmtree(backup_path, ignore_errors=True)
+
+        generated_count = sum(
+            1 for name in os.listdir(commentsubs_path)
+            if re.match(r"^frame_\d+\.jpg$", name, re.IGNORECASE)
+        )
+        print("\n  [SUCCESS] Finalize completed.")
+        print(f"  Frames: {len(survivors):,} | commentsubs images: {generated_count:,}")
+        print("  Manual frame edits are now reflected in commentsubs/.")
+    except (OSError, RuntimeError) as exc:
+        print(f"  [ERROR] Could not replace commentsubs/: {exc}")
+        print("  The previous commentsubs folder was preserved where possible.")
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 def find_video_files(base_dir: str) -> list[str]:
-    """Scans the directory for all MKV (and common video) files."""
+    """Finds supported video files in the script folder.
+    Returns matching filenames in sorted order."""
     valid_exts = (".mkv", ".mp4", ".webm")
     try:
         files = [
@@ -771,8 +1500,193 @@ def find_video_files(base_dir: str) -> list[str]:
     except Exception:
         return []
 
+def probe_video_timing(video_path: str) -> tuple[float, str]:
+    """Reads the source video's duration and frame rate.
+    Returns the values needed to rebuild its original playback timeline."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries",
+            "stream=codec_type,duration,avg_frame_rate,r_frame_rate:format=duration",
+            "-of", "json", video_path
+        ],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffprobe could not read the selected video.")
+
+    data = json.loads(result.stdout or "{}")
+    video_stream = next(
+        (stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"),
+        None
+    )
+    if video_stream is None:
+        raise RuntimeError("The selected file does not contain a video stream.")
+
+    duration_value = video_stream.get("duration") or data.get("format", {}).get("duration")
+    try:
+        duration = float(duration_value)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        raise RuntimeError("Could not determine the source video's duration.")
+
+    fps_value = video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "24/1"
+    try:
+        fps = Fraction(fps_value)
+        if fps <= 0 or float(fps) > 240:
+            raise ValueError
+    except (ValueError, ZeroDivisionError):
+        fps = Fraction(24, 1)
+
+    return duration, f"{fps.numerator}/{fps.denominator}"
+
+
+def reconstruct_video(base_dir: str, video_file: str) -> None:
+    """Rebuilds a playable video from processed frames and precise timestamps.
+    Reuses the source video's frame rate, duration, and audio track."""
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        print("  [ERROR] FFmpeg and FFprobe must both be available in PATH.")
+        return
+
+    video_path = video_file if os.path.isabs(video_file) else os.path.join(base_dir, video_file)
+    video_path = os.path.abspath(video_path)
+    frames_dir = os.path.join(base_dir, "frames")
+    timestamp_path = os.path.join(base_dir, "frame_timestamps.json")
+
+    if not os.path.isfile(video_path):
+        print(f"  [ERROR] Source video not found: {sanitize_path(video_path)}")
+        return
+    if not os.path.isdir(frames_dir):
+        print("  [ERROR] frames/ was not found. Run extraction first.")
+        return
+    if not os.path.isfile(timestamp_path):
+        print("  [ERROR] frame_timestamps.json was not found.")
+        print("  Run extraction with this version first to save precise frame timing.")
+        return
+
+    try:
+        survivors, timestamp_data = _read_frame_timeline(base_dir)
+        frame_paths = [
+            os.path.join(frames_dir, f"frame_{item['final_number']}.jpg")
+            for item in survivors
+        ]
+        frame_times = [float(item["time_s"]) for item in survivors]
+        saved_source = timestamp_data.get("source_video") if isinstance(timestamp_data, dict) else None
+
+        if saved_source and os.path.normcase(os.path.basename(saved_source)) != os.path.normcase(os.path.basename(video_path)):
+            print(f"  [WARN] These frames were extracted from: {saved_source}")
+            print(f"  Selected source video: {os.path.basename(video_path)}")
+            confirm = input("  Use this source anyway? (y/n): ").strip().lower()
+            if confirm != "y":
+                print("  Reconstruction cancelled. Returning to the main menu.")
+                return
+
+        source_duration, output_fps = probe_video_timing(video_path)
+        last_time = frame_times[-1]
+        if source_duration <= last_time:
+            intervals = [b - a for a, b in zip(frame_times, frame_times[1:]) if b > a]
+            fallback_interval = sorted(intervals)[len(intervals) // 2] if intervals else 1.0 / float(Fraction(output_fps))
+            source_duration = last_time + fallback_interval
+
+        output_stem = os.path.splitext(os.path.basename(video_path))[0]
+        output_path = os.path.join(base_dir, f"{output_stem}_efioex6_preview.mp4")
+        if os.path.exists(output_path):
+            overwrite = input(f"  {os.path.basename(output_path)} already exists. Overwrite? (y/n): ").strip().lower()
+            if overwrite != "y":
+                print("  Reconstruction cancelled.")
+                return
+
+        manifest_path = os.path.join(base_dir, "efioex6_reconstruction.ffconcat")
+        black_path = os.path.join(base_dir, "efioex6_reconstruction_black.jpg")
+        manifest_lines = ["ffconcat version 1.0"]
+
+        if frame_times[0] > 0.000001:
+            first_image = cv2.imread(frame_paths[0])
+            if first_image is None:
+                raise RuntimeError("Could not read the first generated frame.")
+            if not cv2.imwrite(black_path, np.zeros_like(first_image)):
+                raise RuntimeError("Could not create the opening timeline filler frame.")
+            manifest_lines.extend([
+                "file 'efioex6_reconstruction_black.jpg'",
+                "option framerate 1000000",
+                f"duration {frame_times[0]:.9f}"
+            ])
+
+        for index, (frame_path, frame_time) in enumerate(zip(frame_paths, frame_times)):
+            if index + 1 < len(frame_times):
+                frame_duration = frame_times[index + 1] - frame_time
+            else:
+                frame_duration = source_duration - frame_time
+            frame_duration = max(0.000001, frame_duration)
+            frame_name = os.path.relpath(frame_path, base_dir).replace("\\", "/")
+            manifest_lines.extend([
+                f"file '{frame_name}'",
+                "option framerate 1000000",
+                f"duration {frame_duration:.9f}"
+            ])
+
+        last_frame_name = os.path.relpath(frame_paths[-1], base_dir).replace("\\", "/")
+        manifest_lines.extend([
+            f"file '{last_frame_name}'",
+            "option framerate 1000000"
+        ])
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as file:
+            file.write("\n".join(manifest_lines) + "\n")
+
+        print("\n  Reconstructing video from processed frames...")
+        print(f"  Frames: {len(frame_paths):,} | Source duration: {source_duration:.3f}s | Output FPS: {output_fps}")
+        base_command = [
+            ffmpeg, "-hide_banner", "-y",
+            "-f", "concat", "-safe", "0", "-i", manifest_path,
+            "-i", video_path,
+            "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1",
+            "-r", output_fps, "-t", f"{source_duration:.9f}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-video_track_timescale", "90000",
+            "-c:a", "copy", "-movflags", "+faststart", output_path
+        ]
+        result = subprocess.run(base_command)
+        if result.returncode != 0:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            print("  [WARN] Audio stream-copy failed. Retrying with AAC audio...")
+            retry_command = base_command.copy()
+            audio_index = retry_command.index("copy")
+            retry_command[audio_index] = "aac"
+            retry_command.insert(audio_index + 1, "-b:a")
+            retry_command.insert(audio_index + 2, "192k")
+            result = subprocess.run(retry_command)
+
+        if result.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+            print("\n  [SUCCESS] Reconstructed video created:")
+            print(f"  {sanitize_path(output_path)}")
+            print("  This preview does not modify or participate in the extraction folders.")
+            print("  Processed frames and original audio are synchronized on the source timeline.")
+        else:
+            print("  [ERROR] FFmpeg could not finish the reconstructed video.")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"  [ERROR] Reconstruction failed: {exc}")
+        print("  Returning to the main menu.")
+    finally:
+        for temporary_path in (
+            os.path.join(base_dir, "efioex6_reconstruction.ffconcat"),
+            os.path.join(base_dir, "efioex6_reconstruction_black.jpg")
+        ):
+            if os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+
+
 def select_video_file(base_dir: str) -> str | None:
-    """Scans the folder for MKV files and lets the user choose one."""
+    """Lets the user choose a video from the script folder.
+    Supports manual paths and cancellation when needed."""
     video_files = find_video_files(base_dir)
 
     if not video_files:
@@ -812,19 +1726,9 @@ def select_video_file(base_dir: str) -> str | None:
             pass
         print(f"  Invalid selection. Please enter 1 to {len(video_files)}.")
 
-
-# =============================================================
-# Staged Extraction Pipeline
-# =============================================================
-
 def run_extraction(base_dir: str, video_file: str) -> None:
-    """
-    Executes the extraction pipeline in clean, RAM-safe stages:
-      Stage 1: Streaming Chopping (drops black, stills, thins pans, caps fades at 5 max, async 1024MB write queue)
-      Stage 2: Cyclical & Talking Loop Filter (thins repeated mouth-flaps across 0-100% speech timeline)
-      Stage 3: Safety & Censorship (runs ONLY on surviving frames)
-      Stage 4: Subtitle Burning (burns subtitles into commentsubs/ matching survivors)
-    """
+    """Runs the frame extraction and post-processing stages.
+    Coordinates decoding, filtering, censorship, timestamps, and subtitles."""
     video_path = os.path.join(base_dir, video_file)
     if not os.path.exists(video_path):
         print(f"[ERROR] Video file not found: {sanitize_path(video_path)}")
@@ -844,6 +1748,10 @@ def run_extraction(base_dir: str, video_file: str) -> None:
         if os.path.exists(folder):
             shutil.rmtree(folder)
         os.makedirs(folder, exist_ok=True)
+
+    precise_timestamp_path = os.path.join(base_dir, "frame_timestamps.json")
+    if os.path.exists(precise_timestamp_path):
+        os.remove(precise_timestamp_path)
 
     gpu_info = detect_gpu_capabilities()
     use_gpu = False
@@ -867,17 +1775,12 @@ def run_extraction(base_dir: str, video_file: str) -> None:
         print("  Acceleration:  CPU Multithreaded")
     print("-"*60)
 
-    # ═════════════════════════════════════════════════════════════
-    # STAGE 1: STREAMING CHOPPING & DEDUPLICATION (BUFFERED UP TO 1024 MB)
-    # ═════════════════════════════════════════════════════════════
     print("\n>>> STAGE 1: Chopping & Deduplicating Frames (Streaming Pass)...")
     print("    • Drops pitch-black frames")
     print("    • Drops frozen stills (protects blinks & mouth flaps)")
     print("    • Thins long camera pans (keeps Start 0%, Mid 50%, End 100%)")
     print(f"    • Caps black & text fade transitions (strictly {CONFIG['FADE_MAX_FRAMES']} frames max)")
 
-    # Calculate queue size: each 1280x720 frame is ~2.76 MB in RAM.
-    # We buffer up to 70% of MAX_RAM_BUFFER_MB in queue, strictly capped under 1024 MB.
     frame_size_mb = (CONFIG["OUTPUT_WIDTH"] * int(CONFIG["OUTPUT_WIDTH"] * 9 / 16) * 3) / (1024 * 1024)
     max_queue_frames = max(20, int((CONFIG["MAX_RAM_BUFFER_MB"] * 0.70) / max(0.5, frame_size_mb)))
 
@@ -891,14 +1794,18 @@ def run_extraction(base_dir: str, video_file: str) -> None:
     last_kept_small = None
     processed = 0
     t0 = time.perf_counter()
+    progress_interval = 0.5
+    next_progress_update = t0 + progress_interval
+    progress_line_length = 0
+    progress_was_rendered = False
 
     def submit_survivor(item: dict) -> None:
-        """Submits survivor frame to the high-speed 1024 MB async write buffer."""
+        """Adds a selected frame to the asynchronous writer.
+        Tracks its output number and timestamp."""
         final_idx = len(survivors) + 1
         item["final_number"] = final_idx
         out_path = os.path.join(frames_dir, f"frame_{final_idx}.jpg")
 
-        # Submit uncompressed frame to background writer
         async_writer.submit(out_path, item["bgr"])
 
         survivors.append({
@@ -907,7 +1814,6 @@ def run_extraction(base_dir: str, video_file: str) -> None:
         })
         timestamps[str(final_idx)] = format_timestamp(item["time_s"] or 0.0)
 
-        # Drop references from main thread immediately
         item["bgr"] = None
         item["small"] = None
 
@@ -938,6 +1844,22 @@ def run_extraction(base_dir: str, video_file: str) -> None:
 
         for frame in container.decode(video=0):
             processed += 1
+            now = time.perf_counter()
+            if now >= next_progress_update:
+                elapsed = now - t0
+                fps = processed / elapsed if elapsed > 0 else 0
+                q_len = async_writer.queue.qsize()
+                progress_line = (
+                    f"    Chopping: {processed:,} frames decoded | "
+                    f"Survivors: {len(survivors):,} | "
+                    f"Queue: {q_len}/{max_queue_frames} | {fps:.1f} fps"
+                )
+                padding = " " * max(0, progress_line_length - len(progress_line))
+                print(f"\r{progress_line}{padding}", end="", flush=True)
+                progress_line_length = max(progress_line_length, len(progress_line))
+                progress_was_rendered = True
+                next_progress_update = now + progress_interval
+
             bgr = frame.to_ndarray(format="bgr24")
             h, w = bgr.shape[:2]
             time_s = frame.time or 0.0
@@ -950,7 +1872,6 @@ def run_extraction(base_dir: str, video_file: str) -> None:
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (480, int(out_h * 480 / out_w)), interpolation=cv2.INTER_AREA)
 
-            # Check 1: Pitch Black frame check
             if is_truly_black(small):
                 del bgr, gray, small, frame
                 continue
@@ -969,7 +1890,6 @@ def run_extraction(base_dir: str, video_file: str) -> None:
                 del bgr, gray, frame
                 continue
 
-            # Check 2: Check for Still Image vs Micro-Animation
             max_cell, overall_diff = analyze_grid_difference(prev_small, small)
 
             if max_cell < CONFIG["STILL_DIFF_THRESHOLD"]:
@@ -979,7 +1899,6 @@ def run_extraction(base_dir: str, video_file: str) -> None:
 
             is_micro_anim = (max_cell >= 12.0) and (overall_diff < 4.0)
 
-            # Check 2.5: Fading Transition Check (black fade, text fade)
             is_fade = False
             if not is_micro_anim:
                 is_fade = is_fading_transition(prev_small, small)
@@ -994,7 +1913,6 @@ def run_extraction(base_dir: str, video_file: str) -> None:
                     for ff in fade_buffer.flush():
                         submit_survivor(ff)
 
-            # Check 3: Camera Pan Detection
             transform, inlier_ratio = estimate_pan_transform(prev_small, small)
             is_pan = False
 
@@ -1019,11 +1937,8 @@ def run_extraction(base_dir: str, video_file: str) -> None:
             if processed % 1000 == 0:
                 gc.collect()
 
-            if processed % 500 == 0:
-                elapsed = time.perf_counter() - t0
-                fps = processed / elapsed if elapsed > 0 else 0
-                q_len = async_writer.queue.qsize()
-                print(f"    Chopping: {processed} frames decoded | Survivors: {len(survivors)} | Queue: {q_len}/{max_queue_frames} | {fps:.1f} fps")
+        if progress_was_rendered:
+            print()
 
         if not fade_buffer.is_empty():
             for ff in fade_buffer.flush():
@@ -1033,7 +1948,6 @@ def run_extraction(base_dir: str, video_file: str) -> None:
             for pf in pan_buffer.flush():
                 submit_survivor(pf)
 
-    # Wait for all buffered frames in the 1024 MB queue to finish writing to disk
     print("    • Flushing buffered frames to disk...")
     async_writer.wait_completion()
 
@@ -1044,21 +1958,25 @@ def run_extraction(base_dir: str, video_file: str) -> None:
     stage1_time = time.perf_counter() - t0
     print(f"\n[INFO] Stage 1 Complete in {stage1_time/60:.1f} min! Processed: {processed} frames -> Initial Survivors: {len(survivors)}")
 
-    # ═════════════════════════════════════════════════════════════
-    # STAGE 2: CYCLICAL & TALKING LOOP FILTER
-    # ═════════════════════════════════════════════════════════════
     if CONFIG["ENABLE_LOOP_FILTER"]:
         survivors = filter_cyclical_loops(base_dir, survivors, frames_dir, CONFIG["LOOP_WINDOW_SIZE"])
 
-    # ═════════════════════════════════════════════════════════════
-    # STAGE 3: SAFETY & CENSORSHIP (RUNS ONLY ON REMAINING SURVIVORS)
-    # ═════════════════════════════════════════════════════════════
+    precise_timestamp_data = {
+        "source_video": os.path.basename(video_path),
+        "frames": [
+            {"frame": item["final_number"], "time_s": float(item["time_s"] or 0.0)}
+            for item in survivors
+        ]
+    }
+    with open(precise_timestamp_path, "w", encoding="utf-8") as f:
+        json.dump(precise_timestamp_data, f, indent=2)
+
     blood_count = 0
     lewd_count = 0
 
     if CONFIG["ENABLE_BLOOD_CENSOR"] or CONFIG["ENABLE_LEWD_CENSOR"]:
         print("\n>>> STAGE 3: Applying Safety Filters on Survivors...")
-        print(f"    • Blood threshold: >={CONFIG['BLOOD_THRESHOLD_PERCENT']}% dark crimson (greyscale)")
+        print(f"    • Blood cascade: gate >={CONFIG['BLOOD_THRESHOLD_PERCENT']}% crimson | instant >={CONFIG['BLOOD_HIGH_PERCENT']}% | WD 'blood' tag >={CONFIG['BLOOD_TAG_CONFIDENCE']}")
         print(f"    • Lewd threshold:  >={CONFIG['LEWD_THRESHOLD_PERCENT']}% body skin (blur)")
 
         t_filter = time.perf_counter()
@@ -1074,7 +1992,7 @@ def run_extraction(base_dir: str, video_file: str) -> None:
             was_censored = False
             original_bgr = frame_bgr.copy()
 
-            is_blood, frame_bgr = detect_and_censor_blood(frame_bgr, CONFIG["BLOOD_THRESHOLD_PERCENT"])
+            is_blood, frame_bgr = detect_and_censor_blood(frame_bgr, CONFIG["BLOOD_THRESHOLD_PERCENT"], base_dir)
             if is_blood:
                 was_censored = True
                 blood_count += 1
@@ -1086,7 +2004,7 @@ def run_extraction(base_dir: str, video_file: str) -> None:
 
             if was_censored:
                 if CONFIG["SAVE_CENSORED_REVIEW"]:
-                    rev_path = os.path.join(review_dir, f"frame_{idx}_original.jpg")
+                    rev_path = os.path.join(review_dir, f"frame_{idx}.jpg")
                     write_jpeg(rev_path, original_bgr, CONFIG["QUALITY_CLEAN"])
                 write_jpeg(frame_path, frame_bgr, CONFIG["QUALITY_CLEAN"])
 
@@ -1095,12 +2013,16 @@ def run_extraction(base_dir: str, video_file: str) -> None:
 
         filter_elapsed = time.perf_counter() - t_filter
         print(f"[INFO] Stage 3 Complete in {filter_elapsed:.1f}s! Censored: {blood_count} blood, {lewd_count} lewd.")
+        print(f"    Blood cascade breakdown: {BLOOD_STATS['gate_clear']} cleared at color gate | "
+              f"{BLOOD_STATS['lighting_clear']} cleared by lighting vote | "
+              f"{BLOOD_STATS['tagger_clear']} cleared by WD tagger | "
+              f"{BLOOD_STATS['tagger_flag']} flagged by WD tagger | "
+              f"{BLOOD_STATS['instant']} instant-grey | "
+              f"{BLOOD_STATS['degraded_flag']} flagged (tagger offline) | "
+              f"{BLOOD_STATS['continuity']} flagged by continuity")
     else:
         print("\n[INFO] Stage 3 Skipped (Safety filters disabled in config).")
 
-    # ═════════════════════════════════════════════════════════════
-    # STAGE 4: SUBTITLE BURNING (COMMENTSUBS)
-    # ═════════════════════════════════════════════════════════════
     print("\n>>> STAGE 4: Subtitle Generation (commentsubs/)...")
     sub_stream = CONFIG["SUBTITLE_STREAM"]
     if sub_stream < 0:
@@ -1116,16 +2038,12 @@ def run_extraction(base_dir: str, video_file: str) -> None:
     print(f"  Clean Frames:        {sanitize_path(frames_dir)}/")
     print(f"  Comment Subtitles:   {sanitize_path(subs_dir)}/")
     if blood_count > 0 or lewd_count > 0:
-        print(f"  Censored Originals:  {sanitize_path(review_dir)}/ ({blood_count} blood, {lewd_count} lewd to review)")
+        print(f"  Censored Review:     {sanitize_path(review_dir)}/ ({blood_count} blood, {lewd_count} lewd to review)")
     print("="*60 + "\n")
 
-
-# =============================================================
-# Settings Menu
-# =============================================================
-
 def mode_settings(base_dir: str) -> None:
-    """Interactive settings editor."""
+    """Displays and updates the extractor configuration.
+    Changes are saved to config.txt and reloaded by the main menu."""
     while True:
         cfg = load_config(base_dir)
         gpu = detect_gpu_capabilities()
@@ -1142,7 +2060,7 @@ def mode_settings(base_dir: str) -> None:
         print(f"    [8] Fade Max Frames:            {cfg['FADE_MAX_FRAMES']} frames max")
         print(f"    [9] Max RAM Buffer:             {cfg['MAX_RAM_BUFFER_MB']} MB")
         print(f"    [A] Talking Loop Filter:        {cfg['ENABLE_LOOP_FILTER']}")
-        print(f"    [B] Blood Censorship:           {cfg['ENABLE_BLOOD_CENSOR']} (Threshold: {cfg['BLOOD_THRESHOLD_PERCENT']}%)")
+        print(f"    [B] Blood Censorship:           {cfg['ENABLE_BLOOD_CENSOR']} (Gate: {cfg['BLOOD_THRESHOLD_PERCENT']}% | Instant: {cfg['BLOOD_HIGH_PERCENT']}% | WD tag: {cfg['BLOOD_TAG_CONFIDENCE']} {'on' if cfg['BLOOD_WD_TAGGER'] else 'OFF'})")
         print(f"    [C] Lewd Censorship:            {cfg['ENABLE_LEWD_CENSOR']} (Threshold: {cfg['LEWD_THRESHOLD_PERCENT']}%)")
         print("    [R] Reset to Defaults")
         print("    [0] Back to Main Menu\n")
@@ -1181,17 +2099,27 @@ def mode_settings(base_dir: str) -> None:
             save_config(base_dir, cfg)
             print(f"  Talking Loop Filter set to: {cfg['ENABLE_LOOP_FILTER']}")
         elif choice == "b":
-            sub_opt = input("  Toggle blood censorship [T] or change threshold % [C]? ").strip().lower()
-            if sub_opt == "c":
-                v = input(f"  Enter blood % threshold (current: {cfg['BLOOD_THRESHOLD_PERCENT']}): ").strip()
+            print("  Blood cascade options: [T]oggle censor | [C] gate % | [H] instant-grey % |")
+            print("                         [V] WD blood-tag confidence | [G]oggle WD tagger | [W]oggle lighting vote")
+            sub_opt = input("  Choose: ").strip().lower()
+            pct_keys = {"c": "BLOOD_THRESHOLD_PERCENT", "h": "BLOOD_HIGH_PERCENT", "v": "BLOOD_TAG_CONFIDENCE"}
+            if sub_opt in pct_keys:
+                key = pct_keys[sub_opt]
+                v = input(f"  Enter new value for {key} (current: {cfg[key]}): ").strip()
                 if v:
                     try:
-                        cfg["BLOOD_THRESHOLD_PERCENT"] = float(v)
+                        cfg[key] = float(v)
                         save_config(base_dir, cfg)
                     except ValueError:
                         print("  Invalid number.")
-            else:
+            elif sub_opt == "t":
                 cfg["ENABLE_BLOOD_CENSOR"] = not cfg["ENABLE_BLOOD_CENSOR"]
+                save_config(base_dir, cfg)
+            elif sub_opt == "g":
+                cfg["BLOOD_WD_TAGGER"] = not cfg["BLOOD_WD_TAGGER"]
+                save_config(base_dir, cfg)
+            elif sub_opt == "w":
+                cfg["BLOOD_TAGGER_VARIANTS"] = not cfg["BLOOD_TAGGER_VARIANTS"]
                 save_config(base_dir, cfg)
         elif choice == "c":
             sub_opt = input("  Toggle lewd censorship [T] or change threshold % [C]? ").strip().lower()
@@ -1207,12 +2135,9 @@ def mode_settings(base_dir: str) -> None:
                 cfg["ENABLE_LEWD_CENSOR"] = not cfg["ENABLE_LEWD_CENSOR"]
                 save_config(base_dir, cfg)
 
-
-# =============================================================
-# Main Entry Point
-# =============================================================
-
 def main() -> None:
+    """Loads settings and starts the interactive menu.
+    Routes user choices to extraction, configuration, or exit."""
     base_dir = get_script_dir()
     global CONFIG
     CONFIG = load_config(base_dir)
@@ -1233,9 +2158,11 @@ def main() -> None:
         print(f"   Status: {vid_count_str}  |  {gpu_status}\n")
         print("    [1] Start Streaming Extraction")
         print("    [2] Settings")
-        print("    [3] Exit\n")
+        print("    [3] Reconstruct Preview Video")
+        print("    [4] Finalize Manual Frame Changes")
+        print("    [5] Exit\n")
 
-        choice = input("  Enter 1, 2, or 3: ").strip()
+        choice = input("  Enter 1, 2, 3, 4, or 5: ").strip()
         if choice == "1":
             target = cli_video if cli_video else select_video_file(base_dir)
             if target:
@@ -1244,6 +2171,12 @@ def main() -> None:
             mode_settings(base_dir)
             CONFIG = load_config(base_dir)
         elif choice == "3":
+            target = cli_video if cli_video else select_video_file(base_dir)
+            if target:
+                reconstruct_video(base_dir, target)
+        elif choice == "4":
+            finalize_manual_changes(base_dir)
+        elif choice == "5":
             print("  Bye!")
             sys.exit(0)
         else:
