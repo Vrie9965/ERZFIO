@@ -26,6 +26,12 @@ mins=2
 # Optional: Set your page name to verify token matches during check
 page_name="Every Re:Zero Frame In Order"
 
+# Optional: Facebook Page album ID. Leave blank to post only to the Page.
+# Example only (do not use this sample ID):
+# https://www.facebook.com/media/set/?set=a.1234567890123456&type=3
+# Copy only the digits after "a." from your own album URL.
+album_id=""
+
 # --- Caption Template ---
 # Available variables:
 # {anime_name}, {season}, {episode}, {current_frame}, {total_frame}, {timestamp}

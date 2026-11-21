@@ -121,6 +121,14 @@ else
     record_check "page_name" "PASS" "Optional page name is not configured."
 fi
 
+if [ -z "${album_id:-}" ]; then
+    record_check "album_id" "PASS" "No album configured; album copy is disabled."
+elif is_positive_integer "$album_id"; then
+    record_check "album_id" "PASS" "Configured as a positive numeric album ID."
+else
+    record_check "album_id" "FAIL" "Must be blank or a positive numeric album ID."
+fi
+
 if [ -n "${caption_template:-}" ]; then
     record_check "caption_template" "PASS" "A caption template is configured."
 else
