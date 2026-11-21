@@ -45,7 +45,7 @@ jobs:
 
       - name: Run Frame Poster Batch
         env:
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          FB_PAGE_TOKEN: ${{ secrets.TOK_FB }}
           DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry_run') && '1' || '0' }}
           FPH_OVERRIDE: ${{ github.event.inputs.fph_override }}
         run: |

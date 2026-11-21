@@ -1,6 +1,7 @@
 name: RepoIntegrity
 
 on:
+  push:
   workflow_dispatch: # Can be triggered manually anytime with one click
 
 jobs:
@@ -21,7 +22,7 @@ jobs:
 
       - name: Run Repository Pre-Flight Check
         env:
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          FB_PAGE_TOKEN: ${{ secrets.TOK_FB }}
           DRY_RUN: "1"
         run: |
           bash checkermain.sh
