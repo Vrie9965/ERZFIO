@@ -36,33 +36,44 @@ check_dependencies() {
 check_token() {
     if [ -z "${FB_PAGE_TOKEN:-}" ]; then
         log_error "FB_PAGE_TOKEN secret is not set! Please add it in your repository secrets."
-        exit 1
+        return 1
     fi
 
     # Check token with Facebook Graph API using Bearer header
     local response
-    response=$(curl -s -X GET "https://graph.facebook.com/v19.0/me?fields=id,name" \
-        -H "Authorization: Bearer ${FB_PAGE_TOKEN}")
+    if ! response=$(curl -sS -X GET "https://graph.facebook.com/v19.0/me?fields=id,name" \
+        -H "Authorization: Bearer ${FB_PAGE_TOKEN}"); then
+        log_error "Facebook Token validation request failed."
+        return 1
+    fi
 
     local error_msg
     error_msg=$(echo "$response" | jq -r '.error.message // empty')
 
     if [ -n "$error_msg" ]; then
         log_error "Facebook Token validation failed: $error_msg"
-        exit 1
+        return 1
     fi
 
     local current_page_id
     local current_page_name
     current_page_id=$(echo "$response" | jq -r '.id')
     current_page_name=$(echo "$response" | jq -r '.name')
+    if [ -z "$current_page_id" ] || [ "$current_page_id" = "null" ] ||
+        [ -z "$current_page_name" ] || [ "$current_page_name" = "null" ]; then
+        log_error "Facebook Token validation returned an unexpected response."
+        return 1
+    fi
 
     log_info "Connected to Facebook Page: $current_page_name (ID: $current_page_id)"
 
     # Optional verification against expected page name
     if [ -n "${page_name:-}" ] && [ "$page_name" != "$current_page_name" ]; then
-        log_warn "Page name mismatch: Config expects '$page_name', but token is for '$current_page_name'"
+        log_error "Page name mismatch: Config expects '$page_name', but token is for '$current_page_name'"
+        return 1
     fi
+
+    return 0
 }
 
 # Read value from state.json

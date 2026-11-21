@@ -1,4 +1,4 @@
-name: Check Repository Health
+name: RepoIntegrity
 
 on:
   workflow_dispatch: # Can be triggered manually anytime with one click
